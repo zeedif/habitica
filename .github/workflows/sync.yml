@@ -1,0 +1,70 @@
+name: Sync and Publish
+
+on:
+  schedule:
+    - cron: "30 5 * * *" # after the nightly rebase and release of awinterstein/habitica
+  push:
+    branches:
+      - self-host
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  Sync:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      rebased: ${{ steps.rebase.outputs.rebased }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1000
+      - name: Rebase on awinterstein/habitica
+        id: rebase
+        run: |
+          set -ex
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "GitHub Actions"
+          git fetch https://github.com/awinterstein/habitica.git self-host
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "rebased=false" >> "$GITHUB_OUTPUT"
+          else
+            git rebase FETCH_HEAD
+            git push --force-with-lease origin HEAD:self-host
+            echo "rebased=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  Publish:
+    needs: Sync
+    # Pushes made with GITHUB_TOKEN do not trigger workflows, so the rebase publishes here
+    if: ${{ !cancelled() && needs.Sync.result != 'failure' && (github.event_name == 'push' || needs.Sync.outputs.rebased == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: self-host
+          submodules: true
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build and Push Server
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: server
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/habitica-server:latest
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
